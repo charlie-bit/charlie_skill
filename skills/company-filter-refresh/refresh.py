@@ -52,12 +52,55 @@ import re
 import json
 import argparse
 import time
+import shutil
+import io
+import threading
+from contextlib import redirect_stdout, redirect_stderr
 from datetime import date
 from urllib.parse import quote_plus, urljoin, urlparse
 
-DATA_DIR     = os.path.join(os.path.dirname(__file__), "..", "company-filter", "data")
-COMPANIES    = os.path.join(DATA_DIR, "companies.csv")
-EXECUTIVES   = os.path.join(DATA_DIR, "executives.csv")
+APP_NAME = "Charlie Skill"
+
+
+def _source_data_dir():
+    return os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "company-filter", "data")
+    )
+
+
+def _packaged_data_home():
+    if sys.platform == "darwin":
+        return os.path.expanduser(f"~/Library/Application Support/{APP_NAME}/data")
+    if os.name == "nt":
+        appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
+        return os.path.join(appdata, APP_NAME, "data")
+    return os.path.expanduser(f"~/.local/share/{APP_NAME}/data")
+
+
+def _seed_data_dir():
+    if getattr(sys, "frozen", False):
+        bundle_root = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+        return os.path.join(bundle_root, "seed_data")
+    return _source_data_dir()
+
+
+def _ensure_runtime_data_dir():
+    runtime_dir = _packaged_data_home() if getattr(sys, "frozen", False) else _source_data_dir()
+    os.makedirs(runtime_dir, exist_ok=True)
+
+    seed_dir = _seed_data_dir()
+    for filename in ("companies.csv", "executives.csv", "last_updated.txt", ".gitkeep"):
+        target = os.path.join(runtime_dir, filename)
+        seed = os.path.join(seed_dir, filename)
+        if not os.path.exists(target) and os.path.exists(seed):
+            shutil.copy2(seed, target)
+
+    return runtime_dir
+
+
+DATA_DIR = _ensure_runtime_data_dir()
+COMPANIES = os.path.join(DATA_DIR, "companies.csv")
+EXECUTIVES = os.path.join(DATA_DIR, "executives.csv")
 UPDATED_FILE = os.path.join(DATA_DIR, "last_updated.txt")
 
 COMPANY_FIELDS = [
@@ -1275,10 +1318,110 @@ def cmd_status(args):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# GUI launcher — simple double-click interface for macOS/Windows bundles
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _run_cli_command(name, func, args):
+    buf = io.StringIO()
+    try:
+        with redirect_stdout(buf), redirect_stderr(buf):
+            func(args)
+    except SystemExit as e:
+        buf.write(f"\nExited with code {e.code}\n")
+    except Exception as e:
+        buf.write(f"\nError: {e}\n")
+    return buf.getvalue()
+
+
+def launch_gui():
+    try:
+        import tkinter as tk
+        from tkinter import simpledialog, messagebox, scrolledtext
+    except Exception as e:
+        print(f"GUI unavailable: {e}")
+        print("Run from terminal with a command, for example:")
+        print('  python3 refresh.py search --query "Trimble reseller dealer USA"')
+        return
+
+    root = tk.Tk()
+    root.title("Charlie Skill")
+    root.geometry("760x520")
+
+    text = scrolledtext.ScrolledText(root, wrap=tk.WORD)
+    text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+    def log(msg):
+        text.insert(tk.END, msg)
+        text.see(tk.END)
+
+    def ask_query():
+        return simpledialog.askstring("Search Company", "Enter search keywords:", parent=root)
+
+    def ask_company():
+        return simpledialog.askstring("Company", "Enter company name (optional):", parent=root)
+
+    def run_async(label, runner):
+        def worker():
+            log(f"\n=== {label} ===\n")
+            output = runner()
+            log(output + "\n")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def search_action():
+        query = ask_query()
+        if not query:
+            return
+        limit = simpledialog.askinteger("Limit", "Max results:", parent=root, initialvalue=20, minvalue=1, maxvalue=200) or 20
+        args = argparse.Namespace(source="auto", query=query, industry=None, region=None, topic=None, limit=limit)
+        run_async("Search", lambda: _run_cli_command("search", cmd_search, args))
+
+    def discover_action():
+        company = ask_company()
+        args = argparse.Namespace(company=company or None)
+        run_async("Discover", lambda: _run_cli_command("discover", cmd_discover, args))
+
+    def email_action():
+        company = ask_company()
+        args = argparse.Namespace(pattern=None, company=company or None)
+        run_async("Email", lambda: _run_cli_command("email", cmd_email, args))
+
+    def enrich_action():
+        company = ask_company()
+        args = argparse.Namespace(source="all", company=company or None)
+        run_async("Enrich", lambda: _run_cli_command("enrich", cmd_enrich, args))
+
+    def status_action():
+        args = argparse.Namespace()
+        run_async("Status", lambda: _run_cli_command("status", cmd_status, args))
+
+    buttons = tk.Frame(root)
+    buttons.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+    tk.Button(buttons, text="Search Company", command=search_action).pack(side=tk.LEFT, padx=4)
+    tk.Button(buttons, text="Discover Executives", command=discover_action).pack(side=tk.LEFT, padx=4)
+    tk.Button(buttons, text="Generate Emails", command=email_action).pack(side=tk.LEFT, padx=4)
+    tk.Button(buttons, text="Enrich Contacts", command=enrich_action).pack(side=tk.LEFT, padx=4)
+    tk.Button(buttons, text="Status", command=status_action).pack(side=tk.LEFT, padx=4)
+    tk.Button(buttons, text="Quit", command=root.destroy).pack(side=tk.RIGHT, padx=4)
+
+    log(
+        "Charlie Skill\n"
+        "Use the buttons above to search companies, discover executives, generate emails, enrich contacts, or check status.\n"
+        "This launcher is for double-click use in the packaged app.\n"
+    )
+
+    root.mainloop()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # main
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    if len(sys.argv) == 1:
+        launch_gui()
+        return
+
     parser = argparse.ArgumentParser(
         description="company-filter-refresh: full dataset refresh tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
